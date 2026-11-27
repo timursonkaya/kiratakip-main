@@ -1,0 +1,344 @@
+'use client';
+
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Download, CreditCard, Trash2, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react';
+import {
+  Card, PageHeader, DataTable, Td, TRow,
+  Badge, Money, Btn, EmptyState, TableSkeletonStandalone,
+  toast,
+} from '@/components/ui';
+import { month, date } from '@/lib/format';
+
+type Payment = {
+  id: number;
+  amount: string;
+  method: string;
+  paidAt: string;
+  referenceNo: string | null;
+  notes: string | null;
+  createdAt: string;
+  rentCharge: {
+    periodStart: string;
+    periodEnd: string;
+    tenant: { name: string };
+    unit: { unitNo: string; property: { title: string } };
+    contract: { id: number };
+  };
+};
+
+const METHOD_LABELS: Record<string, string> = {
+  bank:  'Banka',
+  cash:  'Nakit',
+  eft:   'EFT',
+  check: 'Çek',
+  other: 'Diğer',
+};
+
+type SortKey = 'tenant' | 'unit' | 'period' | 'paidAt' | 'amount' | 'method' | 'reference';
+type SortOrder = 'asc' | 'desc';
+
+// Modül seviyesinde: referans sabit kalsın, gereksiz re-sort olmasın
+const ACCESSORS: Record<SortKey, (p: Payment) => string | number> = {
+  tenant:    p => p.rentCharge.tenant.name,
+  // Bina + daire birlikte: aynı binadakiler gruplanır, daire no numerik sıralanır
+  unit:      p => `${p.rentCharge.unit.property.title} ${p.rentCharge.unit.unitNo}`,
+  period:    p => new Date(p.rentCharge.periodStart).getTime(),
+  paidAt:    p => new Date(p.paidAt).getTime(),
+  amount:    p => Number(p.amount),
+  // Hücredeki etikete göre sırala (ham anahtar değil)
+  method:    p => METHOD_LABELS[p.method] ?? p.method,
+  reference: p => p.referenceNo ?? '',
+};
+
+// Metin → artan, sayı/tarih → azalan (ilk tıklamada)
+const DEFAULT_DIR: Record<SortKey, SortOrder> = {
+  tenant:    'asc',
+  unit:      'asc',
+  period:    'desc',
+  paidAt:    'desc',   // en yeni ödemeler önce
+  amount:    'desc',
+  method:    'asc',
+  reference: 'asc',
+};
+
+export default function PaymentsPage() {
+  const [payments,   setPayments]   = useState<Payment[]>([]);
+  const [loading,    setLoading]    = useState(true);
+  const [search,     setSearch]     = useState('');
+  const [method,     setMethod]     = useState('');
+  const [confirmId,  setConfirmId]  = useState<number | null>(null);
+  const [deleting,   setDeleting]   = useState(false);
+
+  // Varsayılan: ödeme tarihi azalan (en yeni önce)
+  const [sort, setSort] = useState<{ key: SortKey; order: SortOrder }>({
+    key: 'paidAt',
+    order: 'desc',
+  });
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    const res = await fetch('/api/payments');
+    if (res.ok) setPayments(await res.json());
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  // Filtre + sıralama + toplam tek yerde; özet kartları da buradan beslenir
+  const { filtered, sorted, totalAmount } = useMemo(() => {
+    const q = search.toLowerCase();
+    const filtered = payments.filter(p => {
+      const matchSearch = !q
+        || p.rentCharge.tenant.name.toLowerCase().includes(q)
+        || p.rentCharge.unit.property.title.toLowerCase().includes(q)
+        || p.rentCharge.unit.unitNo.toLowerCase().includes(q)
+        || (p.referenceNo ?? '').toLowerCase().includes(q);
+      const matchMethod = !method || p.method === method;
+      return matchSearch && matchMethod;
+    });
+
+    const totalAmount = filtered.reduce((s, p) => s + Number(p.amount), 0);
+
+    const acc = ACCESSORS[sort.key];
+    const dir = sort.order === 'asc' ? 1 : -1;
+
+    const sorted = [...filtered].sort((a, b) => {
+      const av = acc(a);
+      const bv = acc(b);
+
+      // Boş değerler (referans yok, vs.) her zaman en sonda
+      const aEmpty = av == null || av === '';
+      const bEmpty = bv == null || bv === '';
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1;
+      if (bEmpty) return -1;
+
+      if (typeof av === 'number' && typeof bv === 'number') {
+        return (av - bv) * dir;
+      }
+      // numeric: true → "D-2" < "D-10"
+      return String(av).localeCompare(String(bv), 'tr', { numeric: true }) * dir;
+    });
+
+    return { filtered, sorted, totalAmount };
+  }, [payments, search, method, sort]);
+
+  async function downloadCsv() {
+    try {
+      const res = await fetch('/api/export/payments');
+      if (!res.ok) throw new Error('İndirme başarısız');
+      const blob     = await res.blob();
+      const filename = res.headers.get('Content-Disposition')?.match(/filename="(.+)"/)?.[1] ?? 'odemeler.csv';
+      const url      = URL.createObjectURL(blob);
+      const a        = document.createElement('a');
+      a.href         = url;
+      a.download     = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      toast.error((e as Error).message);
+    }
+  }
+
+  async function confirmDelete(id: number) {
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/payments/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        toast.success('Ödeme silindi');
+        setConfirmId(null);
+        load();
+      } else {
+        const d = await res.json();
+        toast.error(d.error ?? 'Silinemedi');
+        setConfirmId(null);
+      }
+    } finally {
+      setDeleting(false);
+    }
+  }
+
+  const toggleSort = (key: SortKey) =>
+    setSort(prev =>
+      prev.key === key
+        ? { key, order: prev.order === 'asc' ? 'desc' : 'asc' }
+        : { key, order: DEFAULT_DIR[key] }
+    );
+
+  const header = (label: string, key: SortKey) => {
+    const active = sort.key === key;
+    const nextOrder: SortOrder = active
+      ? (sort.order === 'asc' ? 'desc' : 'asc')
+      : DEFAULT_DIR[key];
+    const Icon = !active ? ArrowUpDown : sort.order === 'asc' ? ArrowUp : ArrowDown;
+
+    return (
+      <button
+        type="button"
+        onClick={() => toggleSort(key)}
+        aria-label={`${label} sütununu ${nextOrder === 'asc' ? 'artan' : 'azalan'} sırala`}
+        style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '0.25rem',
+          background: 'none',
+          border: 'none',
+          padding: 0,
+          font: 'inherit',
+          color: 'inherit',
+          cursor: 'pointer',
+          whiteSpace: 'nowrap',
+          userSelect: 'none',
+        }}
+      >
+        {label}
+        <Icon size={12} style={{ opacity: active ? 1 : 0.4 }} />
+      </button>
+    );
+  };
+
+  const cols = [
+    { label: header('Kiracı', 'tenant')                },   // flexible
+    { label: header('Bina / Daire', 'unit'),  w: 180    },
+    { label: header('Dönem', 'period'),       w: 80     },
+    { label: header('Ödeme Tarihi', 'paidAt'), w: 96    },
+    { label: header('Tutar', 'amount'),       right: true, w: 112 },
+    { label: header('Yöntem', 'method'),      w: 84     },
+    { label: header('Referans', 'reference'), w: 116    },
+    { label: '',                              w: 60     },
+  ];
+
+  return (
+    <>
+      <PageHeader
+        title="Ödemeler"
+        desc={`${payments.length} kayıt`}
+        action={
+          <Btn variant="outline" onClick={downloadCsv}>
+            <Download size={14} strokeWidth={2} style={{ marginRight: 6 }} />
+            CSV İndir
+          </Btn>
+        }
+      />
+
+      {/* Summary card */}
+      <div style={{ display: 'flex', gap: 12 }}>
+        <Card style={{ flex: 1, padding: '16px 20px' }}>
+          <div style={{ fontSize: '0.75rem', color: 'var(--muted)', fontWeight: 500, marginBottom: 4 }}>
+            Toplam Tahsilat (filtreli)
+          </div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text)' }}>
+            <Money amount={totalAmount} />
+          </div>
+        </Card>
+        <Card style={{ flex: 1, padding: '16px 20px' }}>
+          <div style={{ fontSize: '0.75rem', color: 'var(--muted)', fontWeight: 500, marginBottom: 4 }}>
+            Ödeme Sayısı
+          </div>
+          <div style={{ fontSize: '1.5rem', fontWeight: 700, color: 'var(--text)' }}>
+            {filtered.length}
+          </div>
+        </Card>
+      </div>
+
+      <Card>
+        {/* Filters */}
+        <div style={{ padding: '12px 16px', borderBottom: '1px solid var(--border)', display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <input
+            type="search"
+            placeholder="Kiracı, bina veya referans ara..."
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            style={{ flex: '1 1 220px', minWidth: 180 }}
+          />
+          <select value={method} onChange={e => setMethod(e.target.value)} style={{ width: 140 }}>
+            <option value="">Tüm yöntemler</option>
+            {Object.entries(METHOD_LABELS).map(([v, l]) => (
+              <option key={v} value={v}>{l}</option>
+            ))}
+          </select>
+        </div>
+
+        {loading ? (
+          <TableSkeletonStandalone cols={cols.length} rows={8} />
+        ) : filtered.length === 0 ? (
+          <EmptyState icon={CreditCard} title="Ödeme bulunamadı" />
+        ) : (
+          <DataTable cols={cols}>
+            {sorted.map(p => {
+              const hoursSince = (Date.now() - new Date(p.createdAt).getTime()) / 3600000;
+              const canDelete  = hoursSince <= 24;
+              return (
+                <TRow key={p.id}>
+                  <Td truncate>{p.rentCharge.tenant.name}</Td>
+                  <Td>
+                    <div style={{ fontSize: '0.875rem', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{p.rentCharge.unit.property.title}</div>
+                    <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Daire {p.rentCharge.unit.unitNo}</div>
+                  </Td>
+                  <Td>{month(p.rentCharge.periodStart)}</Td>
+                  <Td>{date(p.paidAt)}</Td>
+                  <Td right><Money amount={Number(p.amount)} /></Td>
+                  <Td>
+                    <Badge variant={
+                      p.method === 'bank'  ? 'info'    :
+                      p.method === 'cash'  ? 'success' :
+                      p.method === 'eft'   ? 'info'    : 'neutral'
+                    }>
+                      {METHOD_LABELS[p.method] ?? p.method}
+                    </Badge>
+                  </Td>
+                  <Td truncate muted>
+                    {p.referenceNo ?? '—'}
+                  </Td>
+                  <Td right>
+                    {canDelete && (
+                      confirmId === p.id ? (
+                        <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                          <button
+                            onClick={() => confirmDelete(p.id)}
+                            disabled={deleting}
+                            style={{
+                              padding: '3px 8px', borderRadius: 5, border: 'none', cursor: 'pointer',
+                              background: 'var(--red)', color: '#fff',
+                              fontSize: '0.75rem', fontWeight: 600,
+                            }}
+                          >
+                            {deleting ? '...' : 'Sil'}
+                          </button>
+                          <button
+                            onClick={() => setConfirmId(null)}
+                            style={{
+                              padding: '3px 8px', borderRadius: 5, border: '1px solid var(--border)',
+                              cursor: 'pointer', background: 'none',
+                              fontSize: '0.75rem', color: 'var(--muted)',
+                            }}
+                          >
+                            İptal
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => setConfirmId(p.id)}
+                          title="Sil (24 saat içinde)"
+                          style={{
+                            background: 'none', border: 'none', cursor: 'pointer',
+                            color: 'var(--red)', padding: '4px', borderRadius: 6,
+                            display: 'flex', alignItems: 'center',
+                          }}
+                          onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'var(--red-bg)'; }}
+                          onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'none'; }}
+                        >
+                          <Trash2 size={14} strokeWidth={2} />
+                        </button>
+                      )
+                    )}
+                  </Td>
+                </TRow>
+              );
+            })}
+          </DataTable>
+        )}
+      </Card>
+    </>
+  );
+}
